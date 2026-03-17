@@ -32,7 +32,7 @@ type = "openai"
 
 [aicoding]
 api_url = "https://api.aicoding.sh"
-type = "openai"
+type = "claude"  # 使用 Claude Messages API 格式
 
 # 示例：添加新供应商配置
 # [new_provider]

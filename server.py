@@ -115,12 +115,19 @@ class ChatCompletionRequest(BaseModel):
 
 # 工具函数：提取客户端 API 密钥
 def extract_client_key(request: Request) -> Optional[str]:
-    """从 Authorization: Bearer <key> 头提取密钥"""
+    """从 Authorization 头提取密钥（支持 Bearer 前缀或直接密钥）"""
     auth = request.headers.get("authorization", "")
+    if not auth:
+        return None
+
+    # 支持 "Bearer <key>" 格式
     if auth.startswith("Bearer "):
         key = auth[7:].strip()
         return key if key else None
-    return None
+
+    # 支持直接传密钥（不带 Bearer 前缀）
+    key = auth.strip()
+    return key if key else None
 
 
 # 工具函数：向单个供应商请求模型列表
@@ -734,6 +741,54 @@ async def handle_t8star_request(request_body: dict, client_api_key: str, provide
             raise
 
 
+# Claude Messages API 处理（用于 aicoding.sh 等使用 Claude API 格式的服务）
+async def handle_claude_request(request_body: dict, client_api_key: str, provider_config: dict) -> Union[dict, StreamingResponse]:
+    """处理 Claude Messages API 请求"""
+    model = request_body.get("model")
+    logger.info(f"📡 路由到 Claude Messages API: {model}")
+
+    async def make_request():
+        # Claude Messages API 使用 /v1/messages 端点
+        endpoint = f"{provider_config['api_url'].rstrip('/')}/v1/messages"
+
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            # Claude API 不需要 Bearer 前缀
+            headers = {
+                "Authorization": client_api_key,
+                "Content-Type": "application/json",
+            }
+
+            response = await client.post(
+                endpoint,
+                json=request_body,
+                headers=headers,
+            )
+            response.raise_for_status()
+            return response
+
+    response = await with_retry(make_request)
+    logger.info(f"✅ Claude API 响应状态: {response.status_code}")
+
+    if request_body.get("stream", False):
+        logger.info("🔄 返回 Claude 流式响应")
+
+        response_headers = dict(response.headers)
+        response_headers.pop("content-length", None)
+        response_headers.pop("content-encoding", None)
+        response_headers["content-type"] = "text/event-stream; charset=utf-8"
+
+        async def generate():
+            async for chunk in response.aiter_bytes(chunk_size=8192):
+                yield chunk
+
+        return StreamingResponse(
+            generate(), status_code=response.status_code, headers=response_headers
+        )
+    else:
+        logger.info("📦 返回 Claude 非流式响应")
+        return response.json()
+
+
 async def handle_proxy(request_data: dict, client_api_key: str):
     """处理代理请求"""
     try:
@@ -799,6 +854,8 @@ async def handle_proxy(request_data: dict, client_api_key: str):
             return await handle_kimi_request(request_data, client_api_key, provider_config)
         elif provider_config["type"] == "deepseek":
             return await handle_deepseek_request(request_data, client_api_key, provider_config)
+        elif provider_config["type"] == "claude":
+            return await handle_claude_request(request_data, client_api_key, provider_config)
         elif provider_config["type"] in ("t8star", "openai"):
             return await handle_t8star_request(request_data, client_api_key, provider_config)
         else:
