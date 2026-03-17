@@ -747,6 +747,11 @@ async def handle_claude_request(request_body: dict, client_api_key: str, provide
     model = request_body.get("model")
     logger.info(f"📡 路由到 Claude Messages API: {model}")
 
+    # 格式转换：确保有 max_tokens 字段（Claude API 必需）
+    if "max_tokens" not in request_body:
+        request_body["max_tokens"] = 4096
+        logger.info(f"🔧 自动添加 max_tokens: 4096")
+
     async def make_request():
         # Claude Messages API 使用 /v1/messages 端点
         endpoint = f"{provider_config['api_url'].rstrip('/')}/v1/messages"
@@ -770,7 +775,7 @@ async def handle_claude_request(request_body: dict, client_api_key: str, provide
     logger.info(f"✅ Claude API 响应状态: {response.status_code}")
 
     if request_body.get("stream", False):
-        logger.info("🔄 返回 Claude 流式响应")
+        logger.info("🔄 返回 Claude 流式响应（转换为 OpenAI 格式）")
 
         response_headers = dict(response.headers)
         response_headers.pop("content-length", None)
@@ -778,8 +783,83 @@ async def handle_claude_request(request_body: dict, client_api_key: str, provide
         response_headers["content-type"] = "text/event-stream; charset=utf-8"
 
         async def generate():
-            async for chunk in response.aiter_bytes(chunk_size=8192):
-                yield chunk
+            """将 Claude SSE 格式转换为 OpenAI SSE 格式"""
+            stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":"):
+                    continue
+
+                # 解析 Claude SSE 格式
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                    continue
+
+                if line.startswith("data:"):
+                    data_str = line[5:].strip()
+
+                    try:
+                        data = json.loads(data_str)
+                        event_type = data.get("type", "")
+
+                        # 转换为 OpenAI 格式
+                        if event_type == "message_start":
+                            # 开始消息，发送初始 chunk
+                            openai_chunk = {
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": ""},
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(openai_chunk)}\n\n".encode("utf-8")
+
+                        elif event_type == "content_block_delta":
+                            # 内容增量
+                            delta = data.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                openai_chunk = {
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": text},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(openai_chunk)}\n\n".encode("utf-8")
+
+                        elif event_type == "message_delta":
+                            # 消息结束
+                            stop_reason = data.get("delta", {}).get("stop_reason")
+                            if stop_reason:
+                                openai_chunk = {
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(openai_chunk)}\n\n".encode("utf-8")
+
+                        elif event_type == "message_stop":
+                            # 流结束
+                            yield b"data: [DONE]\n\n"
+
+                    except json.JSONDecodeError:
+                        logger.warning(f"无法解析 SSE 数据: {data_str[:100]}")
+                        continue
 
         return StreamingResponse(
             generate(), status_code=response.status_code, headers=response_headers
