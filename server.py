@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # 加载模型配置文件
 try:
-    with open("/workspace/models.toml", "r") as f:
+    with open("models.toml", "r") as f:
         MODEL_CONFIG = toml.load(f)
 except FileNotFoundError:
     logger.error("❌ 模型配置文件 models.toml 未找到")
@@ -48,110 +48,43 @@ MAX_RETRIES = int(SERVER_CONFIG.get("max_retries", 3))
 RETRY_DELAY = int(SERVER_CONFIG.get("retry_delay", 1000)) / 1000  # 转换为秒
 REQUEST_TIMEOUT = int(SERVER_CONFIG.get("request_timeout", 60000)) / 1000  # 转换为秒
 
-# API 配置 - 根据配置文件和环境变量动态添加模型
-API_CONFIGS = {}
+# 供应商配置 - 从配置文件加载供应商信息（不包含密钥和模型列表）
+PROVIDER_CONFIGS = {}
 
 # 遍历配置文件中的所有模型供应商
 for provider, config in MODEL_CONFIG.items():
     if provider in ["server", "env_vars", "custom"]:  # 跳过非供应商配置
         continue
-    
-    # 获取该供应商的API密钥
-    api_key = config.get("api_key")
-    
-    # 如果配置文件中没有API密钥，尝试从环境变量获取（支持向后兼容）
-    if not api_key:
-        # 尝试使用供应商名大写作为环境变量名称
-        env_var_name = f"{provider.upper()}_API_KEY"
-        api_key = os.getenv(env_var_name)
-    
-    if not api_key:
-        logger.warning(f"⚠️ 供应商 {provider} 未配置API密钥，跳过该供应商")
-        continue  # 如果没有API密钥，跳过该供应商
-    
+
     # 获取供应商的基础配置
-    provider_type = config["type"]
+    provider_type = config.get("type")
+    api_url = config.get("api_url")
+
+    if not provider_type or not api_url:
+        logger.warning(f"⚠️ 供应商 {provider} 配置不完整，跳过")
+        continue
+
     # 支持通过环境变量覆盖API URL
     api_url_env_var = f"{provider.upper()}_BASE_URL"
-    api_url = os.getenv(api_url_env_var, config["api_url"])
-    
-    # 处理不同供应商的模型配置
-    # 检查是否存在环境变量指定的模型列表（类似T8Star的处理方式）
-    models_env_var = f"{provider.upper()}_MODELS"
-    models_env = os.getenv(models_env_var, "")
-    
-    if models_env:
-        # 通过环境变量获取模型列表
-        models = [m.strip() for m in models_env.split(",") if m.strip()]
-        logger.info(f"  从环境变量加载 {provider} 模型列表: {models}")
-        for model_name in models:
-            API_CONFIGS[model_name] = {
-                "api_url": api_url,
-                "api_key": api_key,
-                "type": provider_type,
-                "name": model_name,
-            }
-    elif config.get("models"):
-        # 普通供应商，直接从配置文件读取模型列表
-        models_from_config = config["models"]
-        logger.info(f"  从配置文件加载 {provider} 模型列表: {[model['name'] for model in models_from_config]}")
-        for model in models_from_config:
-            API_CONFIGS[model["id"]] = {
-                "api_url": api_url,
-                "api_key": api_key,
-                "type": provider_type,
-                "name": model["name"],
-            }
-    else:
-        # 没有模型列表配置
-        logger.warning(f"⚠️ 供应商 {provider} 未配置任何模型，跳过该供应商")
+    api_url = os.getenv(api_url_env_var, api_url)
 
-# 加载自定义模型配置（从TOML文件或环境变量）
-_custom_models_json = MODEL_CONFIG.get("custom", {}).get("custom_models_json", "")
-if not _custom_models_json:
-    _custom_models_json = os.getenv("CUSTOM_MODELS_JSON", "")
+    PROVIDER_CONFIGS[provider] = {
+        "api_url": api_url,
+        "type": provider_type,
+    }
+    logger.info(f"  ✅ 加载供应商: {provider} ({provider_type}) - {api_url}")
 
-if _custom_models_json:
-    try:
-        _items = json.loads(_custom_models_json)
-        if isinstance(_items, list):
-            logger.info(f"  加载自定义模型列表: {[item['name'] for item in _items]}")
-            for _item in _items:
-                _id = _item.get("id")
-                _api_url = _item.get("api_url")
-                _api_key = _item.get("api_key")
-                _api_key_env = _item.get("api_key_env")
-                _type = _item.get("type", "openai")
-                _name = _item.get("name", _id)
-                
-                # 处理API密钥
-                if not _api_key and _api_key_env:
-                    _api_key = os.getenv(_api_key_env)
-                
-                if _id and _api_url and _api_key:
-                    API_CONFIGS[_id] = {
-                        "api_url": _api_url,
-                        "api_key": _api_key,
-                        "type": _type,
-                        "name": _name,
-                    }
-    except Exception as e:
-        logger.error(f"⚠️ 加载自定义模型配置失败: {str(e)}")
-
-if not API_CONFIGS:
-    logger.error("❌ 未配置任何模型API密钥或未找到可用模型")
-    logger.error("请按照以下步骤配置:")
-    logger.error("1. 在 models.toml 文件中为至少一个供应商配置API密钥")
-    logger.error("2. 确保为该供应商配置了至少一个模型")
-    logger.error("或")
-    logger.error("1. 设置至少一个供应商的API密钥环境变量（如: ZHIPU_API_KEY）")
-    logger.error("2. 设置该供应商的模型列表环境变量（如: ZHIPU_MODELS）")
-    logger.error("请设置相应的配置后重新启动服务")
+if not PROVIDER_CONFIGS:
+    logger.error("❌ 未配置任何供应商")
+    logger.error("请在 models.toml 文件中至少配置一个供应商")
     sys.exit(1)
 
-logger.info("📋 已加载模型配置:")
-for model_id, config in API_CONFIGS.items():
-    logger.info(f"   ✅ {model_id} ({config['name']}) - 已配置")
+# 模型路由缓存 - 按客户端 API 密钥缓存 model_id → provider_name 的映射
+MODEL_ROUTE_CACHE: Dict[str, Dict[str, str]] = {}
+MODEL_CACHE_TIMESTAMP: Dict[str, float] = {}
+CACHE_TTL_SECONDS = 300  # 5分钟
+
+logger.info(f"📋 已加载 {len(PROVIDER_CONFIGS)} 个供应商配置")
 
 # FastAPI 应用初始化
 app = FastAPI(
@@ -178,6 +111,73 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
+
+
+# 工具函数：提取客户端 API 密钥
+def extract_client_key(request: Request) -> Optional[str]:
+    """从 Authorization: Bearer <key> 头提取密钥"""
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        key = auth[7:].strip()
+        return key if key else None
+    return None
+
+
+# 工具函数：向单个供应商请求模型列表
+async def fetch_provider_models(provider_name: str, provider_config: dict, api_key: str) -> list:
+    """向单个供应商的 /v1/models 端点请求模型列表，失败静默返回空列表"""
+    try:
+        api_url = provider_config["api_url"]
+        # 尝试标准的 /v1/models 端点
+        models_url = f"{api_url.rstrip('/')}/v1/models"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                models_url,
+                headers={"Authorization": f"Bearer {api_key}"}
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                models = data.get("data", [])
+                logger.info(f"  ✅ {provider_name}: 获取到 {len(models)} 个模型")
+                return [(m.get("id"), provider_name) for m in models if m.get("id")]
+            else:
+                logger.debug(f"  ⚠️ {provider_name}: HTTP {response.status_code}")
+                return []
+    except Exception as e:
+        logger.debug(f"  ⚠️ {provider_name}: {str(e)}")
+        return []
+
+
+# 工具函数：构建模型路由缓存
+async def build_model_cache(api_key: str) -> Dict[str, str]:
+    """并发查询所有供应商，构建 model_id → provider_name 的映射并缓存"""
+    logger.info(f"🔄 开始构建模型缓存...")
+
+    # 并发查询所有供应商
+    tasks = [
+        fetch_provider_models(provider_name, provider_config, api_key)
+        for provider_name, provider_config in PROVIDER_CONFIGS.items()
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 聚合结果
+    model_to_provider = {}
+    for result in results:
+        if isinstance(result, list):
+            for model_id, provider_name in result:
+                if model_id not in model_to_provider:
+                    model_to_provider[model_id] = provider_name
+
+    # 缓存结果
+    cache_key = api_key[:16] if len(api_key) > 16 else api_key  # 使用密钥前缀作为缓存键
+    MODEL_ROUTE_CACHE[cache_key] = model_to_provider
+    MODEL_CACHE_TIMESTAMP[cache_key] = time.time()
+
+    logger.info(f"✅ 模型缓存构建完成，共 {len(model_to_provider)} 个模型")
+    return model_to_provider
 
 
 # 通用重试装饰器
@@ -212,8 +212,9 @@ async def log_requests(request: Request, call_next):
     start_time = datetime.now()
     logger.info(f"{start_time.isoformat()} - {request.method} {request.url.path}")
 
-    # 记录请求头
-    logger.info(f"请求头: {dict(request.headers)}")
+    # 记录请求头（过滤敏感信息）
+    safe_headers = {k: v for k, v in request.headers.items() if k.lower() != "authorization"}
+    logger.info(f"请求头: {safe_headers}")
 
     response = await call_next(request)
 
@@ -236,53 +237,80 @@ async def health_check():
 async def debug_config():
     """调试配置信息"""
     return {
-        "available_models": list(API_CONFIGS.keys()),
-        "config_summary": {
-            model_id: {
-                "name": config["name"],
+        "available_providers": list(PROVIDER_CONFIGS.keys()),
+        "provider_configs": {
+            provider_name: {
                 "type": config["type"],
                 "api_url": config["api_url"],
-                "has_api_key": bool(config.get("api_key")),
             }
-            for model_id, config in API_CONFIGS.items()
+            for provider_name, config in PROVIDER_CONFIGS.items()
         },
+        "cache_info": {
+            "cached_keys": len(MODEL_ROUTE_CACHE),
+            "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        }
     }
 
 
 # 模型列表
 @app.get("/v1/models")
-async def list_models():
-    """返回支持的模型列表"""
-    logger.info("📋 返回模型列表")
+async def list_models(request: Request):
+    """返回支持的模型列表（从上游供应商动态获取）"""
+    logger.info("📋 请求模型列表")
 
+    # 提取客户端 API 密钥
+    client_api_key = extract_client_key(request)
+    if not client_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "未提供 API 密钥，请在请求头中设置 'Authorization: Bearer <your-api-key>'",
+                    "type": "auth_error"
+                }
+            }
+        )
+
+    # 检查缓存
+    cache_key = client_api_key[:16] if len(client_api_key) > 16 else client_api_key
+    cache_time = MODEL_CACHE_TIMESTAMP.get(cache_key, 0)
+    is_cache_valid = (time.time() - cache_time) < CACHE_TTL_SECONDS
+
+    if not is_cache_valid or cache_key not in MODEL_ROUTE_CACHE:
+        # 缓存过期或不存在，重新构建
+        logger.info("🔄 缓存过期或不存在，重新获取模型列表")
+        model_to_provider = await build_model_cache(client_api_key)
+    else:
+        logger.info("✅ 使用缓存的模型列表")
+        model_to_provider = MODEL_ROUTE_CACHE[cache_key]
+
+    # 构建返回的模型列表
     model_list = [
         {
             "id": model_id,
             "object": "model",
             "created": 1677610602,
-            "owned_by": config["type"],
-            "name": config.get("name", model_id),
+            "owned_by": provider_name,
         }
-        for model_id, config in API_CONFIGS.items()
+        for model_id, provider_name in model_to_provider.items()
     ]
 
+    logger.info(f"📋 返回 {len(model_list)} 个模型")
     return {"object": "list", "data": model_list}
 
 
 # 智谱 API 处理
-async def handle_zhipu_request(request_body: dict) -> Union[dict, StreamingResponse]:
+async def handle_zhipu_request(request_body: dict, client_api_key: str, provider_config: dict) -> Union[dict, StreamingResponse]:
     """处理智谱 API 请求"""
     logger.info("📡 路由到智谱API")
 
     async def make_request():
-        config = API_CONFIGS["glm-4.6"]
-
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(
-                f"{config['api_url']}/chat/completions",
+                f"{provider_config['api_url']}/chat/completions",
                 json={**request_body, "model": "glm-4.6"},
                 headers={
-                    "Authorization": f"Bearer {config['api_key']}",
+                    "Authorization": f"Bearer {client_api_key}",
                     "Content-Type": "application/json",
                 },
             )
@@ -317,19 +345,17 @@ async def handle_zhipu_request(request_body: dict) -> Union[dict, StreamingRespo
 
 
 # Kimi API 处理
-async def handle_kimi_request(request_body: dict) -> Union[dict, StreamingResponse]:
+async def handle_kimi_request(request_body: dict, client_api_key: str, provider_config: dict) -> Union[dict, StreamingResponse]:
     """处理 Kimi API 请求"""
     logger.info("📡 路由到Kimi API")
 
     async def make_request():
-        config = API_CONFIGS["kimi-k2-0905-preview"]
-
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(
-                f"{config['api_url']}/chat/completions",
+                f"{provider_config['api_url']}/chat/completions",
                 json={**request_body, "model": "kimi-k2-0905-preview"},
                 headers={
-                    "Authorization": f"Bearer {config['api_key']}",
+                    "Authorization": f"Bearer {client_api_key}",
                     "Content-Type": "application/json",
                 },
             )
@@ -476,19 +502,17 @@ def process_parsed_stream_cache(parsed_stream_cache: str) -> str:
 
 
 # DeepSeek API 处理
-async def handle_deepseek_request(request_body: dict) -> Union[dict, StreamingResponse]:
+async def handle_deepseek_request(request_body: dict, client_api_key: str, provider_config: dict) -> Union[dict, StreamingResponse]:
     """处理 DeepSeek API 请求"""
     logger.info("📡 路由到DeepSeek API")
-    
+
     request_body['messages'] = sanitize_messages(request_body['messages'])
     logger.info('🧹 在 handle_proxy 中已清洗 messages')
-    
+
     model = request_body.get("model", "deepseek-reasoner")
     logger.info(f"🔍 使用 DeepSeek 模型: {model}")
 
     async def make_request():
-        config = API_CONFIGS[model]
-
         # 过滤 DeepSeek API 支持的参数
         supported_params = {
             "model",
@@ -519,15 +543,15 @@ async def handle_deepseek_request(request_body: dict) -> Union[dict, StreamingRe
         if filtered_params:
             logger.info(f"🧹 已过滤不支持的参数: {filtered_params}")
 
-        logger.info(f'📤 发送到 DeepSeek API: {config["api_url"]}/chat/completions')
+        logger.info(f'📤 发送到 DeepSeek API: {provider_config["api_url"]}/chat/completions')
         logger.info(f"📋 请求参数: {list(request_data.keys())}")
 
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.post(
-                f"{config['api_url']}/chat/completions",
+                f"{provider_config['api_url']}/chat/completions",
                 json=request_data,
                 headers={
-                    "Authorization": f"Bearer {config['api_key']}",
+                    "Authorization": f"Bearer {client_api_key}",
                     "Content-Type": "application/json",
                 },
             )
@@ -620,11 +644,10 @@ async def handle_deepseek_request(request_body: dict) -> Union[dict, StreamingRe
         return response.json()  # 代理处理函数
 
 
-async def handle_t8star_request(request_body: dict) -> Union[dict, StreamingResponse]:
+async def handle_t8star_request(request_body: dict, client_api_key: str, provider_config: dict) -> Union[dict, StreamingResponse]:
     model = request_body.get("model")
 
     async def make_request():
-        config = API_CONFIGS[model]
         supported_params = {
             "model",
             "messages",
@@ -641,11 +664,11 @@ async def handle_t8star_request(request_body: dict) -> Union[dict, StreamingResp
         request_data = {k: v for k, v in request_body.items() if k in supported_params}
         request_data["model"] = model
 
-        _path = os.getenv('T8STAR_PATH', '/chat/completions')
-        endpoint = config['api_url'].rstrip('/') + _path
+        _path = os.getenv('T8STAR_PATH', '/v1/chat/completions')
+        endpoint = provider_config['api_url'].rstrip('/') + _path
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             headers = {
-                "Authorization": f"Bearer {config['api_key']}",
+                "Authorization": f"Bearer {client_api_key}",
                 "Content-Type": "application/json",
             }
             if request_body.get("stream"):
@@ -711,40 +734,79 @@ async def handle_t8star_request(request_body: dict) -> Union[dict, StreamingResp
             raise
 
 
-async def handle_proxy(request_data: dict):
+async def handle_proxy(request_data: dict, client_api_key: str):
     """处理代理请求"""
     try:
         model = request_data.get("model")
         logger.info(f"🎯 请求模型: {model}")
         logger.info(f'🔍 是否流式: {request_data.get("stream", False)}')
 
-        if not model or model not in API_CONFIGS:
+        if not model:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": {
-                        "message": f"不支持的模型: {model}。支持的模型: {', '.join(API_CONFIGS.keys())}",
+                        "message": "缺少 model 参数",
                         "type": "invalid_request_error",
                     }
                 },
             )
 
-        config = API_CONFIGS[model]
+        # 检查模型路由缓存
+        cache_key = client_api_key[:16] if len(client_api_key) > 16 else client_api_key
+        cache_time = MODEL_CACHE_TIMESTAMP.get(cache_key, 0)
+        is_cache_valid = (time.time() - cache_time) < CACHE_TTL_SECONDS
 
-        if config["type"] == "zhipu":
-            return await handle_zhipu_request(request_data)
-        elif config["type"] == "kimi":
-            return await handle_kimi_request(request_data)
-        elif config["type"] == "deepseek":
-            return await handle_deepseek_request(request_data)
-        elif config["type"] in ("t8star", "openai"):
-            return await handle_t8star_request(request_data)
+        # 如果缓存无效或不存在，重新构建
+        if not is_cache_valid or cache_key not in MODEL_ROUTE_CACHE:
+            logger.info("🔄 缓存过期或不存在，重新获取模型列表")
+            model_to_provider = await build_model_cache(client_api_key)
+        else:
+            model_to_provider = MODEL_ROUTE_CACHE[cache_key]
+
+        # 查找模型对应的供应商
+        provider_name = model_to_provider.get(model)
+        if not provider_name:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": f"不支持的模型: {model}。请先调用 /v1/models 查看可用模型列表",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        # 获取供应商配置
+        provider_config = PROVIDER_CONFIGS.get(provider_name)
+        if not provider_config:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": {
+                        "message": f"供应商配置不存在: {provider_name}",
+                        "type": "internal_error",
+                    }
+                },
+            )
+
+        logger.info(f"📍 路由到供应商: {provider_name} ({provider_config['type']})")
+
+        # 根据供应商类型调用对应的处理函数
+        if provider_config["type"] == "zhipu":
+            return await handle_zhipu_request(request_data, client_api_key, provider_config)
+        elif provider_config["type"] == "kimi":
+            return await handle_kimi_request(request_data, client_api_key, provider_config)
+        elif provider_config["type"] == "deepseek":
+            return await handle_deepseek_request(request_data, client_api_key, provider_config)
+        elif provider_config["type"] in ("t8star", "openai"):
+            return await handle_t8star_request(request_data, client_api_key, provider_config)
         else:
             raise HTTPException(
                 status_code=500,
                 detail={
                     "error": {
-                        "message": f"未知的模型类型: {config['type']}",
+                        "message": f"未知的供应商类型: {provider_config['type']}",
                         "type": "internal_error",
                     }
                 },
@@ -789,6 +851,19 @@ async def handle_proxy(request_data: dict):
 async def chat_completions(request: Request):
     """OpenAI 兼容的聊天完成接口"""
     try:
+        # 提取客户端 API 密钥
+        client_api_key = extract_client_key(request)
+        if not client_api_key:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": {
+                        "message": "未提供 API 密钥，请在请求头中设置 'Authorization: Bearer <your-api-key>'",
+                        "type": "auth_error"
+                    }
+                }
+            )
+
         body = await request.json()
         logger.info(f"请求体: {body}")
 
@@ -817,7 +892,7 @@ async def chat_completions(request: Request):
                 },
             )
 
-        return await handle_proxy(body)
+        return await handle_proxy(body, client_api_key)
     except HTTPException:
         raise
     except Exception as e:
@@ -837,9 +912,22 @@ async def chat_completions(request: Request):
 async def api_chat_completions(request: Request):
     """备用聊天完成接口"""
     try:
+        # 提取客户端 API 密钥
+        client_api_key = extract_client_key(request)
+        if not client_api_key:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": {
+                        "message": "未提供 API 密钥，请在请求头中设置 'Authorization: Bearer <your-api-key>'",
+                        "type": "auth_error"
+                    }
+                }
+            )
+
         body = await request.json()
         logger.info(f"API接口请求体: {body}")
-        return await handle_proxy(body)
+        return await handle_proxy(body, client_api_key)
     except HTTPException:
         raise
     except Exception as e:
@@ -859,9 +947,22 @@ async def api_chat_completions(request: Request):
 async def messages(request: Request):
     """消息接口"""
     try:
+        # 提取客户端 API 密钥
+        client_api_key = extract_client_key(request)
+        if not client_api_key:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": {
+                        "message": "未提供 API 密钥，请在请求头中设置 'Authorization: Bearer <your-api-key>'",
+                        "type": "auth_error"
+                    }
+                }
+            )
+
         body = await request.json()
         logger.info(f"消息接口请求体: {body}")
-        return await handle_proxy(body)
+        return await handle_proxy(body, client_api_key)
     except HTTPException:
         raise
     except Exception as e:
@@ -880,14 +981,14 @@ async def messages(request: Request):
 # 启动函数
 def main():
     """启动服务器"""
-    logger.info("🚀 Xcode AI 代理服务已启动")
+    logger.info("🚀 Xcode AI 代理服务已启动（多租户模式）")
     logger.info(f"📡 监听地址: http://{HOST}:{PORT}")
-    logger.info("🎯 当前可用的模型:")
-    for model, config in API_CONFIGS.items():
-        logger.info(f"   ✅ {model} ({config.get('name', config['type'])})")
+    logger.info("🎯 已配置的供应商:")
+    for provider, config in PROVIDER_CONFIGS.items():
+        logger.info(f"   ✅ {provider} ({config['type']}) - {config['api_url']}")
 
-    if not API_CONFIGS:
-        logger.error("❌ 没有可用的模型，请检查环境变量配置")
+    if not PROVIDER_CONFIGS:
+        logger.error("❌ 没有可用的供应商，请检查 models.toml 配置")
         return
 
     logger.info("⚙️ 重试配置:")
@@ -897,8 +998,9 @@ def main():
 
     logger.info("📋 配置 Xcode:")
     logger.info(f"   ANTHROPIC_BASE_URL: http://localhost:{PORT}")
-    logger.info("   ANTHROPIC_AUTH_TOKEN: any-string-works")
-    logger.info("🔧 功能: 智谱/Kimi/DeepSeek代理，流式响应，动态配置，智能重试")
+    logger.info("   ANTHROPIC_AUTH_TOKEN: <your-api-key>")
+    logger.info("💡 提示: 客户端需要在 Authorization 头中传入自己的 API 密钥")
+    logger.info("🔧 功能: 多租户支持，动态模型列表，流式响应，智能重试")
 
     uvicorn.run(
         "server:app", host=HOST, port=PORT, reload=False, log_level="info"
